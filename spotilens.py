@@ -23,7 +23,6 @@ SCROLL_DELAY = 0.01
 IMG_SCALE_FACTOR = 3
 DILATE_ITERATIONS = 10  # pure magic 10
 threshold = 0.8
-screenshots = []
 
 
 def capture_points():
@@ -51,16 +50,8 @@ def take_screenshots():
     scroll_speed = int(-abs(tl.y - br.y) * 0.4)
 
     # focus window
+    pag.sleep(1)
     pag.moveTo(*neutral)
-    pag.dragTo(4, 4)
-
-    pag.press('end')
-    pag.sleep(1)
-
-    end_frame = ImageGrab.grab(bbox=capture_box)
-
-    pag.press('home')
-    pag.sleep(1)
 
     previous_frame = None
 
@@ -72,7 +63,6 @@ def take_screenshots():
         if current_frame == previous_frame:
             break
 
-        # screenshots.append(current_frame)
         process_image(current_frame)
         previous_frame = current_frame
 
@@ -89,7 +79,7 @@ def process_image(img: Image):
     for op in operations:
         opencv_img = op(opencv_img)
 
-    opencv_img = draw_bounding_boxes(opencv_img)
+    extract_text(opencv_img)
 
 
 def make_grayscale(img):
@@ -122,21 +112,35 @@ def add_gaussian_blur(img):
     return cv.GaussianBlur(img, (5, 5), 0)
 
 
-def draw_bounding_boxes(img):
+def extract_text(img):
     res = img.copy()
-    kernel = cv.getStructuringElement(cv.MORPH_CROSS, (3, 3))
+    # horizontal line kernel
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 1))
     dilated = cv.dilate(img, kernel, iterations=DILATE_ITERATIONS)
-    # return dilated
-
-    contours, hierarchy = cv.findContours(
-        dilated, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE
-    )
-
+    contours, _ = cv.findContours(dilated, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    
+    rect = []
     for countour in contours:
         x, y, w, h = cv.boundingRect(countour)
-        cv.rectangle(res, (x, y), (x + w, y + h), (255, 0, 255), 2)
+        rect.append((x, y, w, h))
+        # cv.rectangle(res, (x, y), (x + w, y + h), (255, 0, 255), 2)
+    
+    
+    # split to groups title-artist
+    # making use of fact that gap between title-artist pairs is equal and bigger than others
+    # countours are iterated from bottom up, so reverse order for convenience
+    rect_a = np.array(rect[::-1])
+    diff = np.diff(rect_a[:, 1])
+    idx = np.flatnonzero(diff - np.max(diff))
+    groups = np.split(rect_a, idx)
+    
+    for group in groups:
+        # accepting only valid groups of title-artist
+        # groups that have partial entries will be processes on following iterations
+        if len(group) == 2:
+            
 
-    return res
+    # preview(res)
 
 
 def pil_to_opencv(img: Image):
