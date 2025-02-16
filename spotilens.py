@@ -2,8 +2,13 @@ import keyboard
 import pyautogui as pag
 import numpy as np
 import cv2 as cv
+import pytesseract
+import pprint
 
-from dataclasses import dataclass
+from pytesseract import Output
+from pathlib import Path
+from collections import defaultdict
+from dataclasses import dataclass, asdict
 from PIL import Image, ImageGrab
 
 
@@ -13,16 +18,24 @@ class FrameData:
     img: np.array = None
 
 
-# Features inside artist name
 # SIGN 1 - E(explicit)
 # SIGN 2 - MUSIC VIDEO
 SELECTION_ORDER = ['SIGN 1', 'SIGN 2', 'TRACKS AREA']
 FRAMES = {name: FrameData() for name in SELECTION_ORDER}
 CONTROL_KEYS = '1 2'.split()
 SCROLL_DELAY = 0.01
+SCROLL_FACTOR = 0.3
 IMG_SCALE_FACTOR = 3
 DILATE_ITERATIONS = 10  # pure magic 10
-threshold = 0.8
+FILTER_THRESHOLD = 0.8
+INDENT = 4
+
+TES_LANGS = 'eng+jpn+rus'
+TES_CFG = r'--psm 7 --oem 3 '
+
+SONGS = []
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
 def capture_points():
@@ -47,7 +60,7 @@ def take_screenshots():
     tl, br = FRAMES['TRACKS AREA'].box
     capture_box = (*tl, *br)
     neutral = ((tl.x + br.x) / 2, (tl.y + br.y) / 2)
-    scroll_speed = int(-abs(tl.y - br.y) * 0.4)
+    scroll_speed = int(-abs(tl.y - br.y) * SCROLL_FACTOR)
 
     # focus window
     pag.sleep(1)
@@ -73,13 +86,14 @@ def process_image(img: Image):
         filter_signs,
         make_black_and_white,
         upscale,
-        add_gaussian_blur,
     ]
     opencv_img = pil_to_opencv(img)
     for op in operations:
         opencv_img = op(opencv_img)
 
-    extract_text(opencv_img)
+    extracted_songs = extract_songs_from_image(opencv_img)
+    print(extracted_songs)
+    # print_to_file(extracted_songs)
 
 
 def make_grayscale(img):
@@ -98,7 +112,7 @@ def filter_signs(img):
         template = FRAMES[sign].img
         w, h = template.shape[::-1]
         match_point = cv.matchTemplate(img, template, cv.TM_CCOEFF_NORMED)
-        loc = np.where(match_point >= threshold)
+        loc = np.where(match_point >= FILTER_THRESHOLD)
         for pt in zip(*loc[::-1]):
             res[pt[1] : (pt[1] + h), pt[0] : (pt[0] + w)] = 0
     return res
@@ -108,39 +122,67 @@ def upscale(img):
     return cv.resize(src=img, dsize=None, fx=IMG_SCALE_FACTOR, fy=IMG_SCALE_FACTOR)
 
 
-def add_gaussian_blur(img):
-    return cv.GaussianBlur(img, (5, 5), 0)
-
-
-def extract_text(img):
-    res = img.copy()
+def extract_songs_from_image(img):
+    songs_on_img = []
     # horizontal line kernel
-    kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 1))
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 3))
     dilated = cv.dilate(img, kernel, iterations=DILATE_ITERATIONS)
     contours, _ = cv.findContours(dilated, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
-    
+
     rect = []
-    for countour in contours:
-        x, y, w, h = cv.boundingRect(countour)
-        rect.append((x, y, w, h))
-        # cv.rectangle(res, (x, y), (x + w, y + h), (255, 0, 255), 2)
-    
-    
-    # split to groups title-artist
-    # making use of fact that gap between title-artist pairs is equal and bigger than others
-    # countours are iterated from bottom up, so reverse order for convenience
+    for contour in contours:
+        x, y, w, h = cv.boundingRect(contour)
+        # rect.append((x, y, w, h))
+        rect.append(cv.boundingRect(contour))
+        # cv.rectangle(img, (x, y), (x + w, y + h), (255, 0, 255), 2)
+
+    # split text countours into title-artist pairs
+    # making use of fact that gap between songs is bigger than any other
+    # countours are iterated from bottom up, so reversing order for convinience
+
     rect_a = np.array(rect[::-1])
     diff = np.diff(rect_a[:, 1])
-    idx = np.flatnonzero(diff - np.max(diff))
+    max_diff = np.max(diff)
+    idx = np.flatnonzero(np.abs(diff - max_diff) < (max_diff * 0.2)) + 1
     groups = np.split(rect_a, idx)
-    
-    for group in groups:
-        # accepting only valid groups of title-artist
-        # groups that have partial entries will be processes on following iterations
-        if len(group) == 2:
-            
 
-    # preview(res)
+    # print('\n\n')
+    # print(f'GROUPS:\n{groups}\n')
+    # print(f'IDX:\n{np.diff(idx)}\n')
+    # print(f'GROUP OUT:')
+
+    for group in groups:
+
+        # accepring only tuples of 2 items: title and artist
+        # filtered out items will appear on following screenshots
+
+        if len(group) == 2:
+            data = []
+            for box in group:
+                x, y, w, h = box
+                x = x - INDENT
+                y = y - INDENT
+                w = w + INDENT
+                y = y + INDENT
+                img_region = img[y : (y + h), x : (x + w)]
+                extracted_str = pytesseract.image_to_string(
+                    img_region, lang=TES_LANGS, config=TES_CFG
+                )
+                data.append(extracted_str)
+            songs_on_img.append(tuple(data))
+
+    return songs_on_img
+
+
+def print_to_file(data):
+    filename = 'playlist.txt'
+    dest_path = Path.cwd() / filename
+    if not dest_path.exists():
+        dest_path.touch()
+
+    with dest_path.open(mode='w', encoding='utf-8') as f:
+        for item in data:
+            f.write(item)
 
 
 def pil_to_opencv(img: Image):
@@ -161,6 +203,7 @@ def preview(img):
             fy=(1 / IMG_SCALE_FACTOR),
         ),
     )
+    # cv.imshow('img', img)
     cv.waitKey(0)
 
 
