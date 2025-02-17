@@ -2,12 +2,10 @@ import keyboard
 import pyautogui as pag
 import numpy as np
 import cv2 as cv
-import pytesseract
-import pprint
+import tesserocr
 
-from pytesseract import Output
+from datetime import datetime
 from pathlib import Path
-from collections import defaultdict
 from dataclasses import dataclass, asdict
 from PIL import Image, ImageGrab
 
@@ -27,15 +25,17 @@ SCROLL_DELAY = 0.01
 SCROLL_FACTOR = 0.3
 IMG_SCALE_FACTOR = 3
 DILATE_ITERATIONS = 10  # pure magic 10
+DILATE_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (5, 3))
 FILTER_THRESHOLD = 0.8
-INDENT = 4
 
 TES_LANGS = 'eng+jpn+rus'
-TES_CFG = r'--psm 7 --oem 3 '
-
-SONGS = []
-
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+TES_PATH = r'C:/Program Files/Tesseract-OCR/tessdata/.'
+tesapi = tesserocr.PyTessBaseAPI(
+    path=TES_PATH,
+    oem=tesserocr.OEM.DEFAULT,
+    psm=tesserocr.PSM.SINGLE_LINE,
+    lang=TES_LANGS,
+)
 
 
 def capture_points():
@@ -56,17 +56,17 @@ def capture_points():
         FRAMES[frame].img = make_grayscale(img)
 
 
-def take_screenshots():
+def scan_window() -> list[tuple]:
     tl, br = FRAMES['TRACKS AREA'].box
     capture_box = (*tl, *br)
     neutral = ((tl.x + br.x) / 2, (tl.y + br.y) / 2)
     scroll_speed = int(-abs(tl.y - br.y) * SCROLL_FACTOR)
 
-    # focus window
     pag.sleep(1)
     pag.moveTo(*neutral)
 
     previous_frame = None
+    songs = []
 
     while True:
         current_frame = ImageGrab.grab(bbox=capture_box)
@@ -76,11 +76,17 @@ def take_screenshots():
         if current_frame == previous_frame:
             break
 
-        process_image(current_frame)
+        current_img = preprocess_image(current_frame)
+        extracted_songs = extract_songs_from_image(current_img)
+        songs.extend(extracted_songs)
+        # print(extracted_songs)
+
         previous_frame = current_frame
 
+    return songs
 
-def process_image(img: Image):
+
+def preprocess_image(img: Image):
     operations = [
         make_grayscale,
         filter_signs,
@@ -91,9 +97,7 @@ def process_image(img: Image):
     for op in operations:
         opencv_img = op(opencv_img)
 
-    extracted_songs = extract_songs_from_image(opencv_img)
-    print(extracted_songs)
-    # print_to_file(extracted_songs)
+    return opencv_img
 
 
 def make_grayscale(img):
@@ -122,34 +126,34 @@ def upscale(img):
     return cv.resize(src=img, dsize=None, fx=IMG_SCALE_FACTOR, fy=IMG_SCALE_FACTOR)
 
 
-def extract_songs_from_image(img):
-    songs_on_img = []
-    # horizontal line kernel
-    kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 3))
-    dilated = cv.dilate(img, kernel, iterations=DILATE_ITERATIONS)
+def get_bounding_boxes(img) -> list:
+    dilated = cv.dilate(img, DILATE_KERNEL, iterations=DILATE_ITERATIONS)
     contours, _ = cv.findContours(dilated, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
 
-    rect = []
+    boxes = []
     for contour in contours:
-        x, y, w, h = cv.boundingRect(contour)
+        # x, y, w, h = cv.boundingRect(contour)
         # rect.append((x, y, w, h))
-        rect.append(cv.boundingRect(contour))
+        boxes.append(cv.boundingRect(contour))
         # cv.rectangle(img, (x, y), (x + w, y + h), (255, 0, 255), 2)
+
+    return boxes
+
+
+def extract_songs_from_image(img) -> list[tuple]:
+    songs_on_img = []
+    boxes = get_bounding_boxes(img)
+    # horizontal line kernel
 
     # split text countours into title-artist pairs
     # making use of fact that gap between songs is bigger than any other
     # countours are iterated from bottom up, so reversing order for convinience
 
-    rect_a = np.array(rect[::-1])
+    rect_a = np.array(boxes[::-1])
     diff = np.diff(rect_a[:, 1])
     max_diff = np.max(diff)
     idx = np.flatnonzero(np.abs(diff - max_diff) < (max_diff * 0.2)) + 1
     groups = np.split(rect_a, idx)
-
-    # print('\n\n')
-    # print(f'GROUPS:\n{groups}\n')
-    # print(f'IDX:\n{np.diff(idx)}\n')
-    # print(f'GROUP OUT:')
 
     for group in groups:
 
@@ -160,14 +164,9 @@ def extract_songs_from_image(img):
             data = []
             for box in group:
                 x, y, w, h = box
-                x = x - INDENT
-                y = y - INDENT
-                w = w + INDENT
-                y = y + INDENT
                 img_region = img[y : (y + h), x : (x + w)]
-                extracted_str = pytesseract.image_to_string(
-                    img_region, lang=TES_LANGS, config=TES_CFG
-                )
+                tesapi.SetImage(opencv_to_pil(img_region))
+                extracted_str = tesapi.GetUTF8Text()
                 data.append(extracted_str)
             songs_on_img.append(tuple(data))
 
@@ -181,16 +180,21 @@ def print_to_file(data):
         dest_path.touch()
 
     with dest_path.open(mode='w', encoding='utf-8') as f:
-        for item in data:
-            f.write(item)
+        f.write(
+            f'NUMBER OF SONGS: {len(data)}\nSCAN DATE: {datetime.today().strftime('%Y-%m-%d')}\n'
+        )
+
+        for i, item in enumerate(data):
+            title, artist = item
+            f.write(f'{i}. {artist} - {title}')
 
 
 def pil_to_opencv(img: Image):
     return cv.cvtColor(np.array(img), cv.COLOR_RGB2BGR)
 
 
-def opencv_to_pil(cv_img):
-    return Image.fromarray()
+def opencv_to_pil(opencv_img):
+    return Image.fromarray(opencv_img)
 
 
 def preview(img):
@@ -207,10 +211,18 @@ def preview(img):
     cv.waitKey(0)
 
 
+def filter_duplicates(songs: list[tuple]) -> list[tuple]:
+    # Python 3.7: dictionaries preserve order
+    filtered = list(dict.fromkeys(songs))
+    return filtered
+
+
 def run():
     pag.hotkey('alt tab'.split())
     capture_points()
-    take_screenshots()
+    songs = scan_window()
+    filtered = filter_duplicates(songs)
+    print_to_file(filtered)
 
 
 if __name__ == '__main__':
