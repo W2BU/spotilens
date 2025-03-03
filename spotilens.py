@@ -24,13 +24,13 @@ class Song:
     duration: str = field(default=None, hash=False, compare=False)
 
 
-# Image regions to cut out: E sign, Music video sign
 CONTROL_KEYS = '1 2'.split()
 # Parameters
 SCROLL_DELAY = 0.01
 SCROLL_FACTOR = 0.20
 IMG_SCALE_FACTOR = 2
 DILATE_ITERATIONS = 5
+HEIGHT_PROPORTION_THRESH = 0.3
 DILATE_KERNEL = None
 DILATE_KERNEL_X_MULT = 0.015
 DILATE_KERNEL_Y_MULT = 0.0025
@@ -48,7 +48,8 @@ TESAPI = tesserocr.PyTessBaseAPI(
     lang=TES_LANGS,
 )
 
-# parts of image to cut
+# Subimgs from cut folder to cut out
+# in particular: explicit content sign(E), music video sign
 subimg_to_cut = []
 # top left, bottom right point of playlist window
 playlist_frame_points = []
@@ -57,6 +58,7 @@ break_found = False
 
 
 def set_dilation_kernel():
+    """Calculates rectangle dilation kernel of size relative to screen resolution"""
     global DILATE_KERNEL
     w, h = get_screen_resolution()
     kw, kh = int(DILATE_KERNEL_X_MULT * IMG_SCALE_FACTOR * w), int(
@@ -80,7 +82,6 @@ def load_cut_regions():
         print(
             f'No {folder_name} folder found or folder is empty. Recognition results might be inaccurate and contain invalid characters.'
         )
-
     global subimg_to_cut
     for file in dest_path.iterdir():
         path_str = str(file)
@@ -90,6 +91,7 @@ def load_cut_regions():
 
 
 def capture_points():
+    """Saves coordinates of top left and bottom right control points"""
     points = []
     global playlist_frame_points
     for key in CONTROL_KEYS:
@@ -235,11 +237,12 @@ def find_text_rows(img):
         del upper_bounds[-1]
 
     # filtering by height
+    # discarding
     heights = [l - u for u, l in zip(upper_bounds, lower_bounds)]
     median_height = median(heights)
     del_idx = []
     for i, height in enumerate(heights):
-        if height < (0.3 * median_height):
+        if height < (HEIGHT_PROPORTION_THRESH * median_height):
             del_idx.append(i)
 
     for i in reversed(del_idx):
@@ -247,6 +250,7 @@ def find_text_rows(img):
         del lower_bounds[i]
 
     # filtering by gap
+    # if the gap between rows is too big, all further rows are discarded
     diffs = np.diff(np.array(upper_bounds), n=2)
     diff_mean = mean(abs(diffs))
 
@@ -292,7 +296,7 @@ def opencv_to_pil(opencv_img: np.array):
     return Image.fromarray(opencv_img)
 
 
-def filter_duplicates(songs: list[tuple]):
+def filter_duplicates(songs):
     # dicts preserve order
     filtered = list(dict.fromkeys(songs))
     return filtered
