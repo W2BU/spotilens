@@ -1,3 +1,14 @@
+"""
+How to use:
+1. Open Spotify Web or Spotify Desktop Client
+2. Open playlist to scan
+3. Check if the current playlist has subimg that can't be defined like E sign or Music video sign next to artist name
+4. If any are present, make screenshots and replace those in cut folder
+5. Move mouse to top left corner of first song title and press '1' on keyboard
+6. Move mouse to bottom left corner right above the music player and after the last song duration. Press '2' on keyboard.
+7. Wait until scanning is finished
+"""
+
 import keyboard
 import pyautogui as pag
 import numpy as np
@@ -383,6 +394,7 @@ def run():
     songs = scan_window()
     print_to_file(songs)
     songs_to_json(songs)
+    pag.hotkey('alt tab'.split())
 
 
 if __name__ == '__main__':
