@@ -7,45 +7,62 @@ import json
 
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from collections import namedtuple
+from statistics import median, mean
 from PIL import Image, ImageGrab
 
 Point = namedtuple('Point', 'x y')
 
 
-@dataclass
+@dataclass(frozen=True)
 class Song:
     title: str = None
     artist: str = None
-    album: str = None
-    date_added: str = None
-    duration: str = None
+    album: str = field(default=None, hash=False, compare=False)
+    date_added: str = field(default=None, hash=False, compare=False)
+    duration: str = field(default=None, hash=False, compare=False)
 
 
 # Image regions to cut out: E sign, Music video sign
-CONTROL_KEYS = '1 2 3'.split()
+CONTROL_KEYS = '1 2'.split()
 SCROLL_DELAY = 0.01
 SCROLL_FACTOR = 0.25
-IMG_SCALE_FACTOR = 3
-DILATE_ITERATIONS = 10
-DILATE_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (7, 3))
+IMG_SCALE_FACTOR = 2
+DILATE_ITERATIONS = 2
+DILATE_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (7, 7))
 FILTER_THRESHOLD = 0.8
+N_PIXELS_THRESHOLD = 10 * IMG_SCALE_FACTOR
+REPLACE_RULES = {'|': 'I', '{': '('}
 
 TES_LANGS = 'eng+jpn+rus'
 TES_PATH = r'C:/Program Files/Tesseract-OCR/tessdata/.'
-TES_THRESHOLD = 60
+TES_THRESHOLD = 40
 TESAPI = tesserocr.PyTessBaseAPI(
     path=TES_PATH,
     oem=tesserocr.OEM.DEFAULT,
-    psm=tesserocr.PSM.SINGLE_LINE,
+    psm=tesserocr.PSM.SINGLE_COLUMN,
     lang=TES_LANGS,
 )
 
 # parts of image to cut
 subimg_to_cut = []
-# top left, album column beginning, bottom right points
+# top left, album column beginning, bottom right point of playlist window
 playlist_frame_points = []
+
+break_found = False
+
+
+def set_dilation_kernel():
+    global DILATE_KERNEL
+    w, h = get_screen_resolution()
+    kw, kh = int(0.015 * IMG_SCALE_FACTOR * w), int(0.0025 * IMG_SCALE_FACTOR * h)
+    DILATE_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (kw, kh))
+
+
+def get_screen_resolution():
+    img = ImageGrab.grab()
+    return img.size
 
 
 def load_cut_regions():
@@ -79,8 +96,8 @@ def capture_points():
     playlist_frame_points.extend(points)
 
 
-def scan_window() -> list[tuple]:
-    tl, br = playlist_frame_points[0], playlist_frame_points[2]
+def scan_window():
+    tl, br = playlist_frame_points[0], playlist_frame_points[-1]
     screenshot_box = (*tl, *br)
     scroll_value = int(-abs(tl.y - br.y) * SCROLL_FACTOR)
 
@@ -89,6 +106,7 @@ def scan_window() -> list[tuple]:
 
     previous_frame = None
     songs = []
+    global break_found
     while True:
         current_frame = ImageGrab.grab(bbox=screenshot_box)
 
@@ -96,7 +114,7 @@ def scan_window() -> list[tuple]:
         pag.moveTo(*br)
         pag.scroll(scroll_value)
 
-        if current_frame == previous_frame:
+        if (current_frame == previous_frame) or break_found:
             break
 
         current_img = preprocess_image(current_frame)
@@ -105,6 +123,7 @@ def scan_window() -> list[tuple]:
 
         previous_frame = current_frame
 
+    songs = filter_duplicates(songs)
     return songs
 
 
@@ -122,16 +141,16 @@ def preprocess_image(img: Image):
     return opencv_img
 
 
-def make_grayscale(img: np.array):
+def make_grayscale(img):
     return cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
 
-def binarize(img: np.array):
-    _, res = cv.threshold(img, 127, 255, cv.THRESH_BINARY)
+def binarize(img):
+    _, res = cv.threshold(img, 180, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
     return res
 
 
-def cut_subimgs(img: np.array):
+def cut_subimgs(img):
     res = img.copy()
     for template in subimg_to_cut:
         w, h = template.shape[::-1]
@@ -142,109 +161,119 @@ def cut_subimgs(img: np.array):
     return res
 
 
-def enlarge(img: np.array):
+def enlarge(img):
     return cv.resize(src=img, dsize=None, fx=IMG_SCALE_FACTOR, fy=IMG_SCALE_FACTOR)
 
 
-def get_text_bboxes(img: np.array) -> list:
-    dilated = cv.dilate(img, DILATE_KERNEL, iterations=DILATE_ITERATIONS)
+def get_text_bboxes(img):
+    dilated = cv.dilate(img, DILATE_KERNEL)
     contours, _ = cv.findContours(dilated, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
 
-    boxes = []
+    bboxes = []
     for contour in contours:
-        # x, y, w, h = cv.boundingRect(contour)
-        # cv.rectangle(img, (x, y), (x + w, y + h), (255, 0, 255), 2)
+        bboxes.append(cv.boundingRect(contour))
 
-        boxes.append(cv.boundingRect(contour))
-
-    # preview(img)
-    return boxes
+    return bboxes
 
 
-def extract_songs_from_image(img: np.array) -> list[tuple]:
+def extract_songs_from_image(img):
+    row_bounds = find_text_rows(img)
 
-    # normalazing relative to upscaled frame coordinate system
-    normalized_points = [
-        Point(
-            (x - playlist_frame_points[0].x) * IMG_SCALE_FACTOR,
-            (y - playlist_frame_points[0].y) * IMG_SCALE_FACTOR,
-        )
-        for x, y in playlist_frame_points
+    global break_found
+    extracted_songs = []
+
+    for u, l in row_bounds:
+        current_row = img[u:l, :]
+        bbox_group = get_text_bboxes(img=current_row)
+
+        if len(bbox_group) >= 3:
+            # sorting by x coordinate
+            bbox_group = sorted(bbox_group, key=lambda x: x[0])
+            # setting title field as first
+            if bbox_group[0][1] > bbox_group[1][1]:
+                bbox_group[1], bbox_group[0] = bbox_group[0], bbox_group[1]
+        else:
+            break_found = True
+            print('exited by len')
+            break
+
+        song_data = text_from_bbox_group(img=current_row, bboxes=bbox_group)
+        extracted_songs.append(song_data)
+
+    return extracted_songs
+
+
+def find_text_rows(img):
+    dilated = cv.dilate(img, DILATE_KERNEL)
+    hist = np.sum(dilated, axis=1) // 255
+
+    h, w = img.shape[:2]
+    upper_bounds = [
+        y
+        for y in range(h - 1)
+        if hist[y] <= N_PIXELS_THRESHOLD and hist[y + 1] > N_PIXELS_THRESHOLD
+    ]
+    lower_bounds = [
+        y
+        for y in range(h - 1)
+        if hist[y] > N_PIXELS_THRESHOLD and hist[y + 1] <= N_PIXELS_THRESHOLD
     ]
 
-    title_artist_part = img[
-        normalized_points[0].y : normalized_points[2].y,
-        normalized_points[0].x : normalized_points[1].x,
-    ].copy()
+    # removing upaired bounds
+    if upper_bounds[0] > lower_bounds[0]:
+        del lower_bounds[0]
 
-    # bounding boxes of title and artist
-    title_artist_bboxes = get_text_bboxes(title_artist_part)
-    all_bboxes = get_text_bboxes(img)
-    # bounding boxes of album, date added, duration fields
-    other_bboxes = list(set(all_bboxes) - set(title_artist_bboxes))
-    # matching title and artist boxes with corresponding fields boxes into single group
-    groups = get_bbox_groups(title_artist_bboxes, other_bboxes)
-    # extracting text in boxes from img
-    songs_on_img = groups_to_text(img, groups)
+    if upper_bounds[-1] > lower_bounds[-1]:
+        del upper_bounds[-1]
 
-    return songs_on_img
+    # filtering by height
+    heights = [l - u for u, l in zip(upper_bounds, lower_bounds)]
+    median_height = median(heights)
+    del_idx = []
+    for i, height in enumerate(heights):
+        if height < (0.3 * median_height):
+            del_idx.append(i)
 
+    for i in reversed(del_idx):
+        del upper_bounds[i]
+        del lower_bounds[i]
 
-def groups_to_text(img: np.array, groups: list[tuple]) -> list[tuple]:
-    songs_on_img = []
-    for group in groups:
-        data = []
-        is_confident = True
-        for bbox in group:
-            x, y, w, h = bbox
-            # cv.rectangle(img, (x, y), (x + w, y + h), (255, 0, 255), 2)
-            # preview(img)
-            img_region = img[y : (y + h), x : (x + w)]
-            TESAPI.SetImage(opencv_to_pil(img_region))
+    # filtering by gap
+    diffs = np.diff(np.array(upper_bounds), n=2)
+    diff_mean = mean(diffs)
 
-            # if TESAPI.MeanTextConf() < TES_THRESHOLD:
-            #     is_confident = False
+    for i, diff in enumerate(diffs[:-1]):
+        if abs(diff) > (diff_mean + N_PIXELS_THRESHOLD):
+            global break_found
+            break_found = True
+            print('exited by diff')
+            del upper_bounds[i + 2 :]
+            del lower_bounds[i + 2 :]
+            break
 
-            extracted_str = TESAPI.GetUTF8Text().rstrip()
-            data.append(extracted_str)
-
-        if is_confident:
-            songs_on_img.append(tuple(data))
-
-    return songs_on_img
+    row_bounds = list(zip(upper_bounds, lower_bounds))
+    return row_bounds
 
 
-def get_bbox_groups(title_artist_bboxes: list[tuple], other_bboxes: list[tuple]):
+def text_from_bbox_group(img, bboxes):
+    data_on_img = []
+    for bbox in bboxes:
+        x, y, w, h = bbox
+        img_region = img[y : (y + h), x : (x + w)]
+        TESAPI.SetImage(opencv_to_pil(img_region))
+        extracted_str = TESAPI.GetUTF8Text().rstrip()
+        extracted_str = adjust_str(extracted_str)
+        data_on_img.append(extracted_str)
 
-    # split text boxes into title-artist pairs
-    # making use of fact that gap between songs is bigger than any other
-    # countours are iterated from bottom up, so reversing order for convinience
+    return tuple_to_song(data_on_img)
 
-    bboxes = np.array(title_artist_bboxes[::-1])
-    diff = np.diff(bboxes[:, 1])
-    max_diff = np.max(diff)
-    idx = np.flatnonzero(np.abs(diff - max_diff) < (max_diff * 0.2)) + 1
-    bbox_groups = np.split(bboxes, idx)
-    bbox_pairs = [group for group in bbox_groups if len(group) == 2]
 
-    song_bboxes = []
-    if other_bboxes:
-        other_bboxes = np.array(other_bboxes)
-        for pair in bbox_pairs:
-            title_bbox, artist_bbox = pair
-            # Y coordinate is more than Y of title and less than Y+H of artist
-            mask = (other_bboxes[:, 1] > (title_bbox[1])) & (
-                other_bboxes[:, 1] < (artist_bbox[1] + artist_bbox[3])
-            )
-            misc_bboxes = other_bboxes[mask]
-            # sorting in left to right order on image
-            misc_bboxes = misc_bboxes[np.argsort(misc_bboxes[:, 0])]
-
-            if len(misc_bboxes) == 3:
-                # album_box, date_added_box, duration_box = song_data
-                song_bboxes.append((title_bbox, artist_bbox, *misc_bboxes))
-
-    return song_bboxes
+def adjust_str(s):
+    s = s.rstrip()
+    for char, replacement in REPLACE_RULES.items():
+        s = s.replace(char, replacement)
+    s = ' '.join(s.split())
+    return s
 
 
 def pil_to_opencv(img: Image):
@@ -255,17 +284,31 @@ def opencv_to_pil(opencv_img: np.array):
     return Image.fromarray(opencv_img)
 
 
-def filter_duplicates(songs: list[tuple]) -> list[tuple]:
+def filter_duplicates(songs: list[tuple]):
     # dicts preserve order
     filtered = list(dict.fromkeys(songs))
     return filtered
 
 
-def tuples_to_song_class(song_tuples: list[tuple]) -> list[Song]:
-    songs = []
-    for stuple in song_tuples:
-        songs.append(Song(*stuple))
-    return songs
+def tuple_to_song(song_data):
+    song = Song()
+    match len(song_data):
+        case 4:
+            song = Song(
+                title=song_data[0],
+                artist=song_data[1],
+                album=song_data[2],
+                duration=song_data[3],
+            )
+        case 5:
+            song = Song(
+                title=song_data[0],
+                artist=song_data[1],
+                album=song_data[2],
+                date_added=song_data[3],
+                duration=song_data[4],
+            )
+    return song
 
 
 def uniquify_filename(base, ext, dest_dir):
@@ -299,7 +342,7 @@ def print_to_file(songs: list[Song]):
 
     with path.open(mode='w', encoding='utf-8') as f:
         f.write(
-            f'NUMBER OF SONGS: {len(songs)}\nSCAN DATE: {datetime.today().strftime('%Y-%m-%d')}\n'
+            f'NUMBER OF SONGS: {len(songs)}\nSCAN DATE: {datetime.today().strftime('%Y-%m-%dT%H:%M:%S')}\n'
         )
 
         for i, song in enumerate(songs):
@@ -320,21 +363,12 @@ def preview(img):
     cv.waitKey(0)
 
 
-def draw_rects(img, bboxes):
-    for bbox in bboxes:
-        x, y, w, h = bbox
-        cv.rectangle(img, (x, y), (x + w, y + h), (255, 0, 255), 2)
-
-    preview(img)
-
-
 def run():
     pag.hotkey('alt tab'.split())
     load_cut_regions()
+    set_dilation_kernel()
     capture_points()
-    song_tuples = scan_window()
-    filtered = filter_duplicates(song_tuples)
-    songs = tuples_to_song_class(filtered)
+    songs = scan_window()
     print_to_file(songs)
     songs_to_json(songs)
 
