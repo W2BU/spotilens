@@ -19,21 +19,24 @@ Point = namedtuple('Point', 'x y')
 class Song:
     title: str = None
     artist: str = None
-    album: str = field(default=None, hash=False, compare=False)
-    date_added: str = field(default=None, hash=False, compare=False)
+    album: str = None
+    date_added: str = None
     duration: str = field(default=None, hash=False, compare=False)
 
 
 # Image regions to cut out: E sign, Music video sign
 CONTROL_KEYS = '1 2'.split()
+# Parameters
 SCROLL_DELAY = 0.01
-SCROLL_FACTOR = 0.25
+SCROLL_FACTOR = 0.20
 IMG_SCALE_FACTOR = 2
-DILATE_ITERATIONS = 2
-DILATE_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (7, 7))
+DILATE_ITERATIONS = 5
+DILATE_KERNEL = None
+DILATE_KERNEL_X_MULT = 0.015
+DILATE_KERNEL_Y_MULT = 0.0025
 FILTER_THRESHOLD = 0.8
-N_PIXELS_THRESHOLD = 10 * IMG_SCALE_FACTOR
-REPLACE_RULES = {'|': 'I', '{': '('}
+N_PIXELS_THRESHOLD = 5 * IMG_SCALE_FACTOR
+REPLACE_RULES = {'|': 'I', '{': '(', '}': ')'}
 
 TES_LANGS = 'eng+jpn+rus'
 TES_PATH = r'C:/Program Files/Tesseract-OCR/tessdata/.'
@@ -47,16 +50,18 @@ TESAPI = tesserocr.PyTessBaseAPI(
 
 # parts of image to cut
 subimg_to_cut = []
-# top left, album column beginning, bottom right point of playlist window
+# top left, bottom right point of playlist window
 playlist_frame_points = []
-
+# playlist ending was found
 break_found = False
 
 
 def set_dilation_kernel():
     global DILATE_KERNEL
     w, h = get_screen_resolution()
-    kw, kh = int(0.015 * IMG_SCALE_FACTOR * w), int(0.0025 * IMG_SCALE_FACTOR * h)
+    kw, kh = int(DILATE_KERNEL_X_MULT * IMG_SCALE_FACTOR * w), int(
+        DILATE_KERNEL_Y_MULT * IMG_SCALE_FACTOR * h
+    )
     DILATE_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (kw, kh))
 
 
@@ -76,6 +81,7 @@ def load_cut_regions():
             f'No {folder_name} folder found or folder is empty. Recognition results might be inaccurate and contain invalid characters.'
         )
 
+    global subimg_to_cut
     for file in dest_path.iterdir():
         path_str = str(file)
         if path_str.endswith('.png'):
@@ -85,6 +91,7 @@ def load_cut_regions():
 
 def capture_points():
     points = []
+    global playlist_frame_points
     for key in CONTROL_KEYS:
         while True:
             if keyboard.is_pressed(key):
@@ -146,12 +153,13 @@ def make_grayscale(img):
 
 
 def binarize(img):
-    _, res = cv.threshold(img, 180, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    _, res = cv.threshold(img, 60, 255, cv.THRESH_BINARY)
     return res
 
 
 def cut_subimgs(img):
     res = img.copy()
+    global subimg_to_cut
     for template in subimg_to_cut:
         w, h = template.shape[::-1]
         match_point = cv.matchTemplate(img, template, cv.TM_CCOEFF_NORMED)
@@ -240,10 +248,10 @@ def find_text_rows(img):
 
     # filtering by gap
     diffs = np.diff(np.array(upper_bounds), n=2)
-    diff_mean = mean(diffs)
+    diff_mean = mean(abs(diffs))
 
     for i, diff in enumerate(diffs[:-1]):
-        if abs(diff) > (diff_mean + N_PIXELS_THRESHOLD):
+        if abs(diff) > (diff_mean + 40):
             global break_found
             break_found = True
             print('exited by diff')
