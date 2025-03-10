@@ -14,6 +14,7 @@ Extract songs from spotify playlist with OCR
 6. Run spotilens.py
 7. Find Spotify window
 8. Select points as shown on picture
-<img width="1280" alt="Spotify_D6RPvTQw4b_red" src="https://github.com/user-attachments/assets/31e63f00-1073-41ca-ab09-36c5fbe5e277" />
+<img width="1280" alt="Spotify_D6RPvTQw4b_red" src="https://github.com/user-attachments/assets/31e63f00-1073-41ca-ab09-36c5fbe5e277"/>
+
 9. Wait until script finishes
-10. Results will be printed in playlist_N.txt and playlist_json_N.txt
+11. Results will be printed in playlist_N.txt and playlist_json_N.txt
